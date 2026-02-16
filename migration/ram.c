@@ -364,6 +364,18 @@ struct RAMSrcPageRequest {
     QSIMPLEQ_ENTRY(RAMSrcPageRequest) next_req;
 };
 
+/*
+ * Batched UFFD write-protection release for background snapshots.
+ * During linear scanning, we defer flush+unprotect operations and
+ * execute them in batches to reduce syscall overhead.
+ */
+#define RAM_SAVE_UNPROTECT_BATCH_MAX 32
+
+typedef struct PendingUnprotect {
+    void *page_address;
+    uint64_t run_length;
+} PendingUnprotect;
+
 /* State of RAM for migration */
 struct RAMState {
     /*
@@ -434,6 +446,16 @@ struct RAMState {
      * Protected by @bitmap_mutex.
      */
     PageLocationHint page_hint;
+
+    /*
+     * Batched UFFD write-protection release for background snapshots.
+     * Linearly-scanned pages accumulate here; faulted pages flush
+     * the batch and unprotect immediately.
+     */
+    PendingUnprotect pending_unprotect[RAM_SAVE_UNPROTECT_BATCH_MAX];
+    int pending_unprotect_count;
+    /* True when the current page was triggered by a UFFD write fault */
+    bool pending_unprotect_is_faulted;
 };
 typedef struct RAMState RAMState;
 
@@ -1490,33 +1512,115 @@ static RAMBlock *poll_fault_page(RAMState *rs, ram_addr_t *offset)
 }
 
 /**
+ * ram_save_flush_pending_unprotects: flush batched UFFD write-protection
+ *   releases. Issues a single qemu_fflush, then unprotects all pending
+ *   ranges with DONTWAKE, and finally wakes all threads with per-range
+ *   UFFDIO_WAKE calls.
+ *
+ * @rs: current RAM state
+ * @pss: page-search-status structure (for flushing the channel)
+ *
+ * Returns 0 on success, negative value in case of an error
+ */
+static int ram_save_flush_pending_unprotects(RAMState *rs,
+                                             PageSearchStatus *pss)
+{
+    int i;
+
+    if (rs->pending_unprotect_count == 0) {
+        return 0;
+    }
+
+    /* Single flush for the entire batch */
+    qemu_fflush(pss->pss_channel);
+
+    for (i = 0; i < rs->pending_unprotect_count; i++) {
+        PendingUnprotect *pu = &rs->pending_unprotect[i];
+        int res = uffd_change_protection(rs->uffdio_fd, pu->page_address,
+                                         pu->run_length, false, true);
+        if (res < 0) {
+            rs->pending_unprotect_count = 0;
+            return res;
+        }
+    }
+
+    /*
+     * Wake all threads that may be blocked on the unprotected ranges.
+     * We issue one wake per range rather than trying to span across
+     * potentially non-contiguous RAMBlock addresses.
+     */
+    for (i = 0; i < rs->pending_unprotect_count; i++) {
+        PendingUnprotect *pu = &rs->pending_unprotect[i];
+        uffd_wakeup(rs->uffdio_fd, pu->page_address, pu->run_length);
+    }
+
+    rs->pending_unprotect_count = 0;
+    return 0;
+}
+
+/**
  * ram_save_release_protection: release UFFD write protection after
- *   a range of pages has been saved
+ *   a range of pages has been saved.
+ *
+ * For fault-driven pages (where a vCPU is blocked), flushes and
+ * unprotects immediately. For linearly-scanned pages, defers the
+ * unprotect into a batch for reduced syscall overhead.
  *
  * @rs: current RAM state
  * @pss: page-search-status structure
  * @start_page: index of the first page in the range relative to pss->block
  *
  * Returns 0 on success, negative value in case of an error
-*/
+ */
 static int ram_save_release_protection(RAMState *rs, PageSearchStatus *pss,
         unsigned long start_page)
 {
-    int res = 0;
+    void *page_address;
+    uint64_t run_length;
 
     /* Check if page is from UFFD-managed region. */
-    if (pss->block->flags & RAM_UF_WRITEPROTECT) {
-        void *page_address = pss->block->host + (start_page << TARGET_PAGE_BITS);
-        uint64_t run_length = (pss->page - start_page) << TARGET_PAGE_BITS;
-
-        /* Flush async buffers before un-protect. */
-        qemu_fflush(pss->pss_channel);
-        /* Un-protect memory range. */
-        res = uffd_change_protection(rs->uffdio_fd, page_address, run_length,
-                false, false);
+    if (!(pss->block->flags & RAM_UF_WRITEPROTECT)) {
+        return 0;
     }
 
-    return res;
+    page_address = pss->block->host + (start_page << TARGET_PAGE_BITS);
+    run_length = (pss->page - start_page) << TARGET_PAGE_BITS;
+
+    if (run_length == 0) {
+        return 0;
+    }
+
+    if (rs->pending_unprotect_is_faulted) {
+        /*
+         * Fault-driven: a vCPU is blocked on this page. Flush any
+         * pending batch first, then flush and unprotect this page
+         * immediately with wake.
+         */
+        int res = ram_save_flush_pending_unprotects(rs, pss);
+        if (res < 0) {
+            return res;
+        }
+        qemu_fflush(pss->pss_channel);
+        return uffd_change_protection(rs->uffdio_fd, page_address,
+                                      run_length, false, false);
+    }
+
+    /* Linear scan: defer to batch */
+    if (rs->pending_unprotect_count >= RAM_SAVE_UNPROTECT_BATCH_MAX) {
+        int res = ram_save_flush_pending_unprotects(rs, pss);
+        if (res < 0) {
+            return res;
+        }
+    }
+
+    {
+        PendingUnprotect *pu =
+            &rs->pending_unprotect[rs->pending_unprotect_count++];
+        pu->page_address = page_address;
+        pu->run_length = run_length;
+    }
+
+    return 0;
 }
 
 /* ram_write_tracking_available: check if kernel supports required UFFD features
@@ -1814,6 +1918,15 @@ static RAMBlock *poll_fault_page(RAMState *rs, ram_addr_t *offset)
     return NULL;
 }
 
+static int ram_save_flush_pending_unprotects(RAMState *rs,
+                                             PageSearchStatus *pss)
+{
+    (void) rs;
+    (void) pss;
+
+    return 0;
+}
+
 static int ram_save_release_protection(RAMState *rs, PageSearchStatus *pss,
         unsigned long start_page)
 {
@@ -1906,6 +2019,14 @@ static bool get_queued_page(RAMState *rs, PageSearchStatus *pss)
          * really rare.
          */
         pss->complete_round = false;
+
+        /*
+         * A fault-driven page means a vCPU is blocked. Mark it so that
+         * ram_save_release_protection() will flush+unprotect immediately
+         * rather than batching. Also flush any pending batch now.
+         */
+        rs->pending_unprotect_is_faulted = true;
+        ram_save_flush_pending_unprotects(rs, pss);
     }
 
     return !!block;
@@ -2363,7 +2484,12 @@ static int ram_find_and_save_block(RAMState *rs)
     while (true){
         if (!get_queued_page(rs, pss)) {
             /* priority queue empty, so just search for something dirty */
-            int res = find_dirty_block(rs, pss);
+            int res;
+
+            /* Linear scan path: no vCPU is blocked, batch unprotects */
+            rs->pending_unprotect_is_faulted = false;
+
+            res = find_dirty_block(rs, pss);
 
             if (res == PAGE_ALL_CLEAN) {
                 break;
@@ -3332,6 +3458,13 @@ static int ram_save_iterate(QEMUFile *f, void *opaque)
                 }
                 i++;
             }
+
+            /*
+             * Flush any remaining batched unprotects before ending the
+             * iteration, so that vCPU writes are not blocked unnecessarily.
+             */
+            ram_save_flush_pending_unprotects(rs,
+                                              &rs->pss[RAM_CHANNEL_PRECOPY]);
         }
     }
 
