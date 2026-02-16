@@ -1579,14 +1579,22 @@ out:
 static inline void populate_read_range(RAMBlock *block, ram_addr_t offset,
                                        ram_addr_t size)
 {
-    const ram_addr_t end = offset + size;
+    /*
+     * Try MADV_POPULATE_READ first (Linux 5.14+). This populates page tables
+     * for the entire range in a single syscall, avoiding per-page
+     * userspace/kernel transitions. Much faster than the byte-read fallback.
+     */
+    if (qemu_madvise((char *)block->host + offset, size,
+                     QEMU_MADV_POPULATE_READ) == 0) {
+        return;
+    }
 
     /*
-     * We read one byte of each page; this will preallocate page tables if
-     * required and populate the shared zeropage on MAP_PRIVATE anonymous memory
-     * where no page was populated yet. This might require adaption when
-     * supporting other mappings, like shmem.
+     * Fallback: read one byte of each page. This will preallocate page tables
+     * if required and populate the shared zeropage on MAP_PRIVATE anonymous
+     * memory where no page was populated yet.
      */
+    const ram_addr_t end = offset + size;
     for (; offset < end; offset += block->page_size) {
         char tmp = *((char *)block->host + offset);
 
