@@ -24,6 +24,7 @@
 #include "system/system.h"
 #include "system/cpu-throttle.h"
 #include "ram.h"
+#include "bpf-fault-snapshot.h"
 #include "migration/cpr.h"
 #include "migration/global_state.h"
 #include "migration/misc.h"
@@ -3723,6 +3724,11 @@ static void *bg_migration_thread(void *opaque)
     }
 
     trace_migration_thread_after_loop();
+
+    /* Final drain of BPF ring buffer to capture any remaining pages */
+    if (migrate_bpf_fault_snapshot()) {
+        ram_save_bpf_final_drain(s->to_dst_file);
+    }
 
 fail:
     if (early_fail) {

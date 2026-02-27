@@ -52,3 +52,6 @@ system_ss.add(when: qatzip, if_true: files('multifd-qatzip.c'))
 system_ss.add(when: 'CONFIG_VFIO',
               if_true: files('vfio.c'),
               if_false: files('vfio-stub.c'))
+system_ss.add(when: libbpf,
+              if_true: files('bpf-fault-snapshot.c'),
+              if_false: files('bpf-fault-snapshot-stub.c'))

@@ -29,6 +29,7 @@
 #include "qemu-file.h"
 #include "ram.h"
 #include "options.h"
+#include "bpf-fault-snapshot.h"
 #include "system/kvm.h"
 
 /* Maximum migrate downtime set to 2000 seconds */
@@ -75,6 +76,8 @@
  * Parameters for self_announce_delay giving a stream of RARP/ARP
  * packets after migration.
  */
+#define DEFAULT_MIGRATE_BPF_FAULT_SNAPSHOT false
+
 #define DEFAULT_MIGRATE_ANNOUNCE_INITIAL  50
 #define DEFAULT_MIGRATE_ANNOUNCE_MAX     550
 #define DEFAULT_MIGRATE_ANNOUNCE_ROUNDS    5
@@ -183,6 +186,9 @@ const Property migration_properties[] = {
     DEFINE_PROP_ZERO_PAGE_DETECTION("zero-page-detection", MigrationState,
                        parameters.zero_page_detection,
                        ZERO_PAGE_DETECTION_MULTIFD),
+    DEFINE_PROP_BOOL("x-bpf-fault-snapshot", MigrationState,
+                     parameters.x_bpf_fault_snapshot,
+                     DEFAULT_MIGRATE_BPF_FAULT_SNAPSHOT),
 
     /* Migration capabilities */
     DEFINE_PROP_MIG_CAP("x-xbzrle", MIGRATION_CAPABILITY_XBZRLE),
@@ -812,6 +818,13 @@ bool migrate_cpu_throttle_tailslow(void)
     return s->parameters.cpu_throttle_tailslow;
 }
 
+bool migrate_bpf_fault_snapshot(void)
+{
+    MigrationState *s = migrate_get_current();
+
+    return s->parameters.x_bpf_fault_snapshot;
+}
+
 bool migrate_direct_io(void)
 {
     MigrationState *s = migrate_get_current();
@@ -1047,7 +1060,7 @@ static void migrate_mark_all_params_present(MigrationParameters *p)
         &p->has_announce_step, &p->has_block_bitmap_mapping,
         &p->has_x_vcpu_dirty_limit_period, &p->has_vcpu_dirty_limit,
         &p->has_mode, &p->has_zero_page_detection, &p->has_direct_io,
-        &p->has_cpr_exec_command,
+        &p->has_cpr_exec_command, &p->has_x_bpf_fault_snapshot,
     };
 
     len = ARRAY_SIZE(has_fields);
@@ -1258,6 +1271,12 @@ bool migrate_params_check(MigrationParameters *params, Error **errp)
         return false;
     }
 
+    if (params->x_bpf_fault_snapshot && !bpf_fault_snapshot_available()) {
+        error_setg(errp, "bpf_fault snapshot not available: "
+                   "requires kernel bpf_fault support and libbpf");
+        return false;
+    }
+
     return true;
 }
 
@@ -1386,6 +1405,10 @@ static void migrate_params_test_apply(MigrationParameters *params,
     if (params->has_cpr_exec_command) {
         dest->cpr_exec_command = params->cpr_exec_command;
     }
+
+    if (params->has_x_bpf_fault_snapshot) {
+        dest->x_bpf_fault_snapshot = params->x_bpf_fault_snapshot;
+    }
 }
 
 static void migrate_params_apply(MigrationParameters *params)
@@ -1513,6 +1536,10 @@ static void migrate_params_apply(MigrationParameters *params)
         qapi_free_strList(s->parameters.cpr_exec_command);
         s->parameters.cpr_exec_command =
             QAPI_CLONE(strList, params->cpr_exec_command);
+    }
+
+    if (params->has_x_bpf_fault_snapshot) {
+        s->parameters.x_bpf_fault_snapshot = params->x_bpf_fault_snapshot;
     }
 }
 

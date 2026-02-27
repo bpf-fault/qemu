@@ -122,5 +122,6 @@ bool ram_write_tracking_compatible(void);
 void ram_write_tracking_prepare(void);
 int ram_write_tracking_start(void);
 void ram_write_tracking_stop(void);
+void ram_save_bpf_final_drain(QEMUFile *f);
 
 #endif

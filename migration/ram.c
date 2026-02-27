@@ -34,6 +34,7 @@
 #include "qemu/main-loop.h"
 #include "xbzrle.h"
 #include "ram.h"
+#include "bpf-fault-snapshot.h"
 #include "migration.h"
 #include "migration-stats.h"
 #include "migration/register.h"
@@ -1478,6 +1479,10 @@ static RAMBlock *poll_fault_page(RAMState *rs, ram_addr_t *offset)
         return NULL;
     }
 
+    if (migrate_bpf_fault_snapshot()) {
+        return NULL;  /* no blocking faults in bpf_fault mode */
+    }
+
     res = uffd_read_events(rs->uffdio_fd, &uffd_msg, 1);
     if (res <= 0) {
         return NULL;
@@ -1504,6 +1509,13 @@ static int ram_save_release_protection(RAMState *rs, PageSearchStatus *pss,
 {
     int res = 0;
 
+    /* Check if page is from bpf_fault-managed region. */
+    if (pss->block->flags & RAM_BPF_FAULT_WP) {
+        qemu_fflush(pss->pss_channel);
+        return bpf_fault_release_protection(pss->block, start_page,
+                                             pss->page - start_page);
+    }
+
     /* Check if page is from UFFD-managed region. */
     if (pss->block->flags & RAM_UF_WRITEPROTECT) {
         void *page_address = pss->block->host + (start_page << TARGET_PAGE_BITS);
@@ -1528,6 +1540,10 @@ bool ram_write_tracking_available(void)
     uint64_t uffd_features;
     int res;
 
+    if (migrate_bpf_fault_snapshot()) {
+        return bpf_fault_snapshot_available();
+    }
+
     res = uffd_query_features(&uffd_features);
     return (res == 0 &&
             (uffd_features & UFFD_FEATURE_PAGEFAULT_FLAG_WP) != 0);
@@ -1542,6 +1558,10 @@ bool ram_write_tracking_compatible(void)
 {
     const uint64_t uffd_ioctls_mask = BIT(_UFFDIO_WRITEPROTECT);
     int uffd_fd;
+
+    if (migrate_bpf_fault_snapshot()) {
+        return true;
+    }
     RAMBlock *block;
     bool ret = false;
 
@@ -1645,10 +1665,23 @@ static void ram_block_populate_read(RAMBlock *rb)
 
 /*
  * ram_write_tracking_prepare: prepare for UFFD-WP memory tracking
+ *
+ * For bpf_fault mode, this also loads and verifies the BPF program
+ * so that the expensive verifier pass happens before the VM is paused.
  */
 void ram_write_tracking_prepare(void)
 {
     RAMBlock *block;
+
+    /*
+     * Pre-load the BPF skeleton before the VM pause to minimize downtime.
+     * The verifier pass is the expensive part.
+     */
+    if (migrate_bpf_fault_snapshot()) {
+        if (bpf_fault_wp_prepare() < 0) {
+            error_report("bpf_fault: failed to prepare BPF program");
+        }
+    }
 
     RCU_READ_LOCK_GUARD();
 
@@ -1714,6 +1747,10 @@ int ram_write_tracking_start(void)
     RAMState *rs = ram_state;
     RAMBlock *block;
 
+    if (migrate_bpf_fault_snapshot()) {
+        return bpf_fault_wp_start();
+    }
+
     /* Open UFFD file descriptor */
     uffd_fd = uffd_create_fd(UFFD_FEATURE_PAGEFAULT_FLAG_WP, true);
     if (uffd_fd < 0) {
@@ -1773,6 +1810,11 @@ void ram_write_tracking_stop(void)
 {
     RAMState *rs = ram_state;
     RAMBlock *block;
+
+    if (migrate_bpf_fault_snapshot()) {
+        bpf_fault_wp_stop();
+        return;
+    }
 
     RCU_READ_LOCK_GUARD();
 
@@ -2241,7 +2283,11 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
         page_dirty = migration_bitmap_clear_dirty(rs, pss->block, pss->page);
 
         /* Check the pages is dirty and if it is send it */
-        if (page_dirty) {
+        if (page_dirty && migrate_bpf_fault_snapshot() &&
+            bpf_fault_page_captured(pss->block, pss->page)) {
+            /* Already captured via BPF ring buffer, skip save */
+            tmppages = 0;
+        } else if (page_dirty) {
             /*
              * Properly yield the lock only in postcopy preempt mode
              * because both migration thread and rp-return thread can
@@ -3321,6 +3367,13 @@ static int ram_save_iterate(QEMUFile *f, void *opaque)
                         trace_ram_save_iterate_big_wait(t1, i);
                         break;
                     }
+
+                    if (migrate_bpf_fault_snapshot()) {
+                        int ring_pages = bpf_fault_poll_ring(f);
+                        if (ring_pages > 0) {
+                            rs->target_page_count += ring_pages;
+                        }
+                    }
                 }
                 i++;
             }
@@ -3354,6 +3407,24 @@ out:
     }
 
     return done;
+}
+
+/*
+ * ram_save_bpf_final_drain: drain remaining BPF ring buffer entries
+ *
+ * Called from bg_migration_thread() after the main migration loop
+ * to ensure all captured pages are written to the migration stream.
+ */
+void ram_save_bpf_final_drain(QEMUFile *f)
+{
+    int ring_pages;
+
+    do {
+        ring_pages = bpf_fault_poll_ring(f);
+        if (ring_pages > 0 && ram_state) {
+            ram_state->target_page_count += ring_pages;
+        }
+    } while (ring_pages > 0);
 }
 
 /**

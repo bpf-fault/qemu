@@ -1,4 +1,4 @@
-SKELETONS = rss.bpf.skeleton.h
+SKELETONS = rss.bpf.skeleton.h bpf_fault_snapshot.bpf.skeleton.h
 
 LLVM_STRIP ?= llvm-strip
 CLANG ?= clang
@@ -12,6 +12,9 @@ all: $(SKELETONS)
 clean:
 	rm -f $(SKELETONS) $(SKELETONS:%.skeleton.h=%.o)
 
+vmlinux.h:
+	bpftool btf dump file /sys/kernel/btf/vmlinux format c > $@
+
 %.o: %.c
 	$(CLANG) $(INC_FLAGS) \
                 -D__KERNEL__ -D__ASM_SYSREG_H \
@@ -19,6 +22,17 @@ clean:
                 $(EXTRA_CFLAGS) -c $< -o $@
 	$(LLVM_STRIP) -g $@
 
-%.skeleton.h: %.o
+rss.bpf.skeleton.h: rss.bpf.o
 	bpftool gen skeleton $< > $@
 	cp $@ ../../ebpf/
+
+bpf_fault_snapshot.bpf.o: bpf_fault_snapshot.bpf.c vmlinux.h
+	$(CLANG) $(INC_FLAGS) \
+                -D__KERNEL__ -D__ASM_SYSREG_H \
+                -I. $(LINUXINCLUDE) \
+                $(EXTRA_CFLAGS) -c $< -o $@
+	$(LLVM_STRIP) -g $@
+
+bpf_fault_snapshot.bpf.skeleton.h: bpf_fault_snapshot.bpf.o
+	bpftool gen skeleton $< > $@
+	cp $@ ../../migration/

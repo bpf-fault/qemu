@@ -801,10 +801,14 @@
 #     is @cpr-exec.  The first list element is the program's filename,
 #     the remainder its arguments.  (Since 10.2)
 #
+# @x-bpf-fault-snapshot: Use bpf_fault write-protection instead of
+#     userfaultfd for background snapshots.  (Since 10.2)
+#
 # Features:
 #
-# @unstable: Members @x-checkpoint-delay and
-#     @x-vcpu-dirty-limit-period are experimental.
+# @unstable: Members @x-checkpoint-delay,
+#     @x-vcpu-dirty-limit-period, and @x-bpf-fault-snapshot are
+#     experimental.
 #
 # Since: 2.4
 ##
@@ -828,7 +832,8 @@
            'mode',
            'zero-page-detection',
            'direct-io',
-           'cpr-exec-command'] }
+           'cpr-exec-command',
+           { 'name': 'x-bpf-fault-snapshot', 'features': ['unstable'] }] }
 
 ##
 # @migrate-set-parameters:
@@ -1004,10 +1009,16 @@
 #     is @cpr-exec.  The first list element is the program's filename,
 #     the remainder its arguments.  (Since 10.2)
 #
+# @x-bpf-fault-snapshot: Use bpf_fault write-protection instead of
+#     userfaultfd for background snapshots.  This provides lower
+#     latency page captures via BPF ring buffer.  Requires kernel
+#     bpf_fault support and libbpf.  Default is false.  (Since 10.2)
+#
 # Features:
 #
-# @unstable: Members @x-checkpoint-delay and
-#     @x-vcpu-dirty-limit-period are experimental.
+# @unstable: Members @x-checkpoint-delay,
+#     @x-vcpu-dirty-limit-period, and @x-bpf-fault-snapshot are
+#     experimental.
 #
 # Since: 2.4
 ##
@@ -1043,7 +1054,9 @@
             '*mode': 'MigMode',
             '*zero-page-detection': 'ZeroPageDetection',
             '*direct-io': 'bool',
-            '*cpr-exec-command': [ 'str' ]} }
+            '*cpr-exec-command': [ 'str' ],
+            '*x-bpf-fault-snapshot': { 'type': 'bool',
+                                       'features': ['unstable'] }} }
 
 ##
 # @query-migrate-parameters:
