@@ -249,7 +249,7 @@ int bpf_fault_wp_start(void)
          */
         link = bpf_map__attach_fault_ops(
             bpf_state.skel->maps.snapshot_fault_ops,
-            block->host, block->max_length, BPF_FAULT_FLAG_WP);
+            block->host, block->used_length, BPF_FAULT_FLAG_WP);
         if (!link) {
             error_report("bpf_fault: failed to attach fault_ops "
                          "for block %s: %s",
@@ -257,10 +257,10 @@ int bpf_fault_wp_start(void)
             goto fail;
         }
 
-        /* Enable write-protection on the full range */
+        /* Enable write-protection on the used range */
         link_fd = bpf_link__fd(link);
         if (bpf_link_writeprotect(link_fd, (uintptr_t)block->host,
-                                   block->max_length,
+                                   block->used_length,
                                    BPF_FAULT_WP_ENABLE) < 0) {
             error_report("bpf_fault: failed to enable WP for block %s: %s",
                          block->idstr, strerror(errno));
@@ -273,6 +273,12 @@ int bpf_fault_wp_start(void)
 
         /* Set up per-block state */
         num_pages = block->used_length >> TARGET_PAGE_BITS;
+        if (!num_pages) {
+            bpf_link__destroy(link);
+            block->flags &= ~RAM_BPF_FAULT_WP;
+            memory_region_unref(block->mr);
+            continue;
+        }
         bs = &bpf_state.block_states[bpf_state.num_blocks];
         bs->block = block;
         bs->link = link;

@@ -1558,12 +1558,12 @@ bool ram_write_tracking_compatible(void)
 {
     const uint64_t uffd_ioctls_mask = BIT(_UFFDIO_WRITEPROTECT);
     int uffd_fd;
+    RAMBlock *block;
+    bool ret = false;
 
     if (migrate_bpf_fault_snapshot()) {
         return true;
     }
-    RAMBlock *block;
-    bool ret = false;
 
     /* Open UFFD file descriptor */
     uffd_fd = uffd_create_fd(UFFD_FEATURE_PAGEFAULT_FLAG_WP, false);
@@ -1679,7 +1679,13 @@ void ram_write_tracking_prepare(void)
      */
     if (migrate_bpf_fault_snapshot()) {
         if (bpf_fault_wp_prepare() < 0) {
-            error_report("bpf_fault: failed to prepare BPF program");
+            /*
+             * Log and continue; bpf_fault_wp_start() will detect the
+             * missing skeleton and return -1, which is properly handled
+             * by ram_write_tracking_start()'s caller.
+             */
+            error_report("bpf_fault: BPF program prepare failed; "
+                         "snapshot will fail at start");
         }
     }
 
@@ -3414,17 +3420,19 @@ out:
  *
  * Called from bg_migration_thread() after the main migration loop
  * to ensure all captured pages are written to the migration stream.
+ * Bounded to avoid infinite looping if the guest keeps dirtying pages.
  */
 void ram_save_bpf_final_drain(QEMUFile *f)
 {
     int ring_pages;
+    int max_rounds = 256;
 
     do {
         ring_pages = bpf_fault_poll_ring(f);
         if (ring_pages > 0 && ram_state) {
             ram_state->target_page_count += ring_pages;
         }
-    } while (ring_pages > 0);
+    } while (ring_pages > 0 && --max_rounds > 0);
 }
 
 /**

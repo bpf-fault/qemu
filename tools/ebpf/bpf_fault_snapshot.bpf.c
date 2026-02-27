@@ -52,7 +52,14 @@ int BPF_PROG(handle_wp_fault, struct bpf_fault_ops_ctx *ops_ctx,
     entry->address = ops_ctx->address;
     for (int i = 0; i < PAGE_SIZE; i++)
         entry->data[i] = src[i];
-    bpf_ringbuf_submit(entry, 0);
+
+    /*
+     * BPF_RB_NO_WAKEUP: skip the per-event IPI to the consumer.
+     * The QEMU migration thread polls the ring buffer periodically,
+     * so per-event wakeup is unnecessary overhead (~66% of BPF
+     * program time is spent in the IPI path otherwise).
+     */
+    bpf_ringbuf_submit(entry, BPF_RB_NO_WAKEUP);
 
     return 0;
 }
