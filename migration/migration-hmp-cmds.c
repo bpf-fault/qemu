@@ -453,6 +453,13 @@ void hmp_info_migrate_parameters(Monitor *mon, const QDict *qdict)
 
         assert(params->has_cpr_exec_command);
         monitor_print_cpr_exec_command(mon, params->cpr_exec_command);
+
+        if (params->has_x_bpf_fault_snapshot) {
+            monitor_printf(mon, "%s: %s\n",
+                           MigrationParameter_str(
+                               MIGRATION_PARAMETER_X_BPF_FAULT_SNAPSHOT),
+                           params->x_bpf_fault_snapshot ? "on" : "off");
+        }
     }
 
     qapi_free_MigrationParameters(params);
@@ -755,6 +762,10 @@ void hmp_migrate_set_parameter(Monitor *mon, const QDict *qdict)
         p->has_cpr_exec_command = true;
         break;
     }
+    case MIGRATION_PARAMETER_X_BPF_FAULT_SNAPSHOT:
+        p->has_x_bpf_fault_snapshot = true;
+        visit_type_bool(v, param, &p->x_bpf_fault_snapshot, &err);
+        break;
     default:
         g_assert_not_reached();
     }

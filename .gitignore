@@ -26,3 +26,4 @@ tools/ebpf/*.bpf.o
 tools/ebpf/*.bpf.skeleton.h
 # Generated skeleton copies (rebuilt via tools/ebpf/Makefile.ebpf)
 migration/bpf_fault_snapshot.bpf.skeleton.h
+build-bpf/
