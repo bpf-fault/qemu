@@ -173,13 +173,15 @@ static int ring_buf_callback(void *ctx, void *data, size_t data_sz)
 bool bpf_fault_snapshot_available(void)
 {
     struct bpf_fault_snapshot_bpf *skel;
+    int ret;
 
     skel = bpf_fault_snapshot_bpf__open();
     if (!skel) {
         return false;
     }
+    ret = bpf_fault_snapshot_bpf__load(skel);
     bpf_fault_snapshot_bpf__destroy(skel);
-    return true;
+    return ret == 0;
 }
 
 int bpf_fault_wp_prepare(void)
@@ -393,10 +395,39 @@ bool bpf_fault_page_captured(RAMBlock *block, unsigned long page)
 int bpf_fault_release_protection(RAMBlock *block, unsigned long start_page,
                                   unsigned long npages)
 {
-    /*
-     * For bpf_fault, write-protection is resolved by the kernel
-     * automatically when the BPF handler returns 0 (allow the write).
-     * This function is a no-op but kept for API symmetry with the uffd path.
-     */
+    BpfFaultBlockState *bs;
+    void *page_address;
+    uint64_t run_length;
+    int link_fd;
+
+    if (!npages) {
+        return 0;
+    }
+
+    bs = find_block_state(block);
+    if (!bs || !bs->link) {
+        error_report("bpf_fault: missing link state while resolving WP for %s",
+                     block ? block->idstr : "<null>");
+        return -1;
+    }
+
+    if (start_page >= bs->num_pages || npages > bs->num_pages - start_page) {
+        error_report("bpf_fault: invalid WP resolve range for %s "
+                     "(start_page=%lu npages=%lu num_pages=%lu)",
+                     block->idstr, start_page, npages, bs->num_pages);
+        return -1;
+    }
+
+    page_address = block->host + (start_page << TARGET_PAGE_BITS);
+    run_length = npages << TARGET_PAGE_BITS;
+    link_fd = bpf_link__fd(bs->link);
+
+    if (bpf_link_writeprotect(link_fd, (uintptr_t)page_address,
+                               run_length, 0) < 0) {
+        error_report("bpf_fault: failed to resolve WP for block %s: %s",
+                     block->idstr, strerror(errno));
+        return -1;
+    }
+
     return 0;
 }
