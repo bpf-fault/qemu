@@ -62,7 +62,7 @@ void bpf_fault_wp_stop(void);
  *
  * Returns number of pages written, or negative on error.
  */
-int bpf_fault_poll_ring(QEMUFile *f);
+int bpf_fault_poll_ring(QEMUFile *f, RAMBlock **last_sent_block);
 
 /**
  * bpf_fault_page_captured: check if a page was already captured via ring buffer

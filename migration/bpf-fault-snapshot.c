@@ -12,6 +12,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "qemu/error-report.h"
 #include "qemu/bitmap.h"
 #include "exec/target_page.h"
@@ -61,9 +62,12 @@ static struct {
     struct ring_buffer *ringbuf;
     BpfFaultBlockState *block_states;
     int num_blocks;
+    GByteArray *ring_batch;
     /* Set during poll_ring for callback context */
     QEMUFile *current_file;
-    RAMBlock *last_sent_block;
+    RAMBlock **current_last_sent_block;
+    RAMBlock *last_resolved_block;
+    BpfFaultBlockState *last_resolved_bs;
     int pages_written;
 } bpf_state;
 
@@ -85,39 +89,57 @@ static int bpf_link_writeprotect(int link_fd, uint64_t start, uint64_t len,
  */
 static BpfFaultBlockState *find_block_state(RAMBlock *block)
 {
+    if (bpf_state.last_resolved_block == block) {
+        return bpf_state.last_resolved_bs;
+    }
+
     for (int i = 0; i < bpf_state.num_blocks; i++) {
         if (bpf_state.block_states[i].block == block) {
+            bpf_state.last_resolved_block = block;
+            bpf_state.last_resolved_bs = &bpf_state.block_states[i];
             return &bpf_state.block_states[i];
         }
     }
+
+    bpf_state.last_resolved_block = block;
+    bpf_state.last_resolved_bs = NULL;
     return NULL;
 }
 
 /**
- * bpf_fault_write_page: write a captured page to the migration stream
+ * bpf_fault_batch_append_page: append a captured page in migration wire format
  *
- * Writes the page header (offset + block identification) followed by
- * the page data in the standard QEMU migration wire format.
+ * Serializes the page header (offset + block identification) followed by
+ * the page data into the per-poll batch buffer. The batch is handed off to
+ * QEMUFile asynchronously once ring polling finishes, so we avoid immediate
+ * per-page writes while keeping the wire format unchanged.
  */
-static void bpf_fault_write_page(QEMUFile *f, RAMBlock *block,
-                                  ram_addr_t offset, const uint8_t *data)
+static void bpf_fault_batch_append_page(RAMBlock *block, ram_addr_t offset,
+                                        const uint8_t *data)
 {
     ram_addr_t wire_offset = offset | RAM_SAVE_FLAG_PAGE;
-    bool same_block = (block == bpf_state.last_sent_block);
+    RAMBlock **last_sent_block = bpf_state.current_last_sent_block;
+    bool same_block = last_sent_block && (block == *last_sent_block);
+    uint8_t be64_buf[sizeof(uint64_t)];
 
     if (same_block) {
         wire_offset |= RAM_SAVE_FLAG_CONTINUE;
     }
-    qemu_put_be64(f, wire_offset);
+    stq_be_p(be64_buf, wire_offset);
+    g_byte_array_append(bpf_state.ring_batch, be64_buf, sizeof(be64_buf));
 
     if (!same_block) {
-        size_t len = strlen(block->idstr);
-        qemu_put_byte(f, len);
-        qemu_put_buffer(f, (uint8_t *)block->idstr, len);
-        bpf_state.last_sent_block = block;
+        uint8_t len = strlen(block->idstr);
+
+        g_byte_array_append(bpf_state.ring_batch, &len, sizeof(len));
+        g_byte_array_append(bpf_state.ring_batch,
+                            (const uint8_t *)block->idstr, len);
+        if (last_sent_block) {
+            *last_sent_block = block;
+        }
     }
 
-    qemu_put_buffer(f, data, TARGET_PAGE_SIZE);
+    g_byte_array_append(bpf_state.ring_batch, data, TARGET_PAGE_SIZE);
     ram_transferred_add(TARGET_PAGE_SIZE);
 }
 
@@ -160,8 +182,8 @@ static int ring_buf_callback(void *ctx, void *data, size_t data_sz)
         return 0;
     }
 
-    /* Write page to migration stream */
-    bpf_fault_write_page(bpf_state.current_file, block, offset, page_data);
+    /* Queue page for batched write to the migration stream */
+    bpf_fault_batch_append_page(block, offset, page_data);
 
     /* Mark page as captured */
     set_bit(page, bs->captured_bitmap);
@@ -201,6 +223,16 @@ int bpf_fault_wp_prepare(void)
         ring_buf_callback, NULL, NULL);
     if (!bpf_state.ringbuf) {
         error_report("bpf_fault: failed to create ring buffer consumer");
+        bpf_fault_snapshot_bpf__destroy(bpf_state.skel);
+        bpf_state.skel = NULL;
+        return -1;
+    }
+
+    bpf_state.ring_batch = g_byte_array_sized_new(16 * TARGET_PAGE_SIZE);
+    if (!bpf_state.ring_batch) {
+        error_report("bpf_fault: failed to allocate ring batch buffer");
+        ring_buffer__free(bpf_state.ringbuf);
+        bpf_state.ringbuf = NULL;
         bpf_fault_snapshot_bpf__destroy(bpf_state.skel);
         bpf_state.skel = NULL;
         return -1;
@@ -310,11 +342,14 @@ fail:
     g_free(bpf_state.block_states);
     bpf_state.block_states = NULL;
     bpf_state.num_blocks = 0;
+    bpf_state.last_resolved_block = NULL;
+    bpf_state.last_resolved_bs = NULL;
 
     if (bpf_state.ringbuf) {
         ring_buffer__free(bpf_state.ringbuf);
         bpf_state.ringbuf = NULL;
     }
+    g_clear_pointer(&bpf_state.ring_batch, g_byte_array_unref);
     bpf_fault_snapshot_bpf__destroy(bpf_state.skel);
     bpf_state.skel = NULL;
 
@@ -329,6 +364,7 @@ void bpf_fault_wp_stop(void)
         ring_buffer__free(bpf_state.ringbuf);
         bpf_state.ringbuf = NULL;
     }
+    g_clear_pointer(&bpf_state.ring_batch, g_byte_array_unref);
 
     RCU_READ_LOCK_GUARD();
 
@@ -349,36 +385,57 @@ void bpf_fault_wp_stop(void)
     g_free(bpf_state.block_states);
     bpf_state.block_states = NULL;
     bpf_state.num_blocks = 0;
+    bpf_state.last_resolved_block = NULL;
+    bpf_state.last_resolved_bs = NULL;
 
     if (bpf_state.skel) {
         bpf_fault_snapshot_bpf__destroy(bpf_state.skel);
         bpf_state.skel = NULL;
     }
 
-    bpf_state.last_sent_block = NULL;
+    bpf_state.current_last_sent_block = NULL;
 }
 
-int bpf_fault_poll_ring(QEMUFile *f)
+int bpf_fault_poll_ring(QEMUFile *f, RAMBlock **last_sent_block)
 {
     int ret;
 
-    if (!bpf_state.ringbuf) {
+    if (!bpf_state.ringbuf || !bpf_state.ring_batch) {
         return 0;
     }
 
     bpf_state.current_file = f;
+    bpf_state.current_last_sent_block = last_sent_block;
     bpf_state.pages_written = 0;
+    g_byte_array_set_size(bpf_state.ring_batch, 0);
 
     /* Non-blocking poll: timeout = 0 */
     ret = ring_buffer__poll(bpf_state.ringbuf, 0);
+    if (bpf_state.ring_batch->len) {
+        GByteArray *batch = bpf_state.ring_batch;
+        gsize batch_len = batch->len;
+        uint8_t *payload = g_byte_array_free(batch, false);
+
+        bpf_state.ring_batch = g_byte_array_sized_new(batch_len);
+        if (!bpf_state.ring_batch) {
+            g_free(payload);
+            bpf_state.current_file = NULL;
+            bpf_state.current_last_sent_block = NULL;
+            error_report("bpf_fault: failed to reallocate ring batch buffer");
+            return -ENOMEM;
+        }
+
+        qemu_put_buffer_async(f, payload, batch_len, true);
+    }
+
     if (ret < 0 && ret != -EINTR) {
         error_report("bpf_fault: ring buffer poll error: %s",
                      strerror(-ret));
-        return ret;
     }
 
     bpf_state.current_file = NULL;
-    return bpf_state.pages_written;
+    bpf_state.current_last_sent_block = NULL;
+    return (ret < 0 && ret != -EINTR) ? ret : bpf_state.pages_written;
 }
 
 bool bpf_fault_page_captured(RAMBlock *block, unsigned long page)

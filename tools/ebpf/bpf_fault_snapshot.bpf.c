@@ -39,7 +39,6 @@ int BPF_PROG(handle_wp_fault, struct bpf_fault_ops_ctx *ops_ctx,
              unsigned char *buf)
 {
     struct ring_buf_entry *entry;
-    volatile unsigned char *src = (volatile unsigned char *)buf;
 
     if (!buf)
         return 0;
@@ -50,8 +49,10 @@ int BPF_PROG(handle_wp_fault, struct bpf_fault_ops_ctx *ops_ctx,
     }
 
     entry->address = ops_ctx->address;
-    for (int i = 0; i < PAGE_SIZE; i++)
-        entry->data[i] = src[i];
+    if (bpf_probe_read_kernel(entry->data, PAGE_SIZE, (const void *)buf)) {
+        bpf_ringbuf_discard(entry, 0);
+        return 0;
+    }
 
     /*
      * BPF_RB_NO_WAKEUP: skip the per-event IPI to the consumer.
