@@ -2275,6 +2275,7 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
     size_t pagesize_bits =
         qemu_ram_pagesize(pss->block) >> TARGET_PAGE_BITS;
     unsigned long start_page = pss->page;
+    bool any_captured = false;
     int res;
 
     if (migrate_ram_is_ignored(pss->block)) {
@@ -2291,8 +2292,11 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
         /* Check the pages is dirty and if it is send it */
         if (page_dirty && migrate_bpf_fault_snapshot() &&
             bpf_fault_page_captured(pss->block, pss->page)) {
-            /* Already captured via BPF ring buffer, skip save */
+            /* Already captured via BPF ring buffer, skip save.
+             * The kernel WP-fault handler already cleared WP for this page,
+             * so we don't need to release it again from userspace. */
             tmppages = 0;
+            any_captured = true;
         } else if (page_dirty) {
             /*
              * Properly yield the lock only in postcopy preempt mode
@@ -2329,6 +2333,19 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
     } while (pss_within_range(pss));
 
     pss_host_page_finish(pss);
+
+    /*
+     * For bpf_fault, the kernel WP-fault handler already cleared WP for any
+     * ring-captured pages in this host page. With hugepages disabled (the
+     * only supported configuration for bpf_fault), the host page is a single
+     * target page, so we can skip the release entirely when that page was
+     * captured. With hugepages enabled, this would leak WP on some captured
+     * pages — they'd take a redundant ring buffer round-trip on the next
+     * write, but the snapshot remains correct.
+     */
+    if (any_captured && (pss->block->flags & RAM_BPF_FAULT_WP)) {
+        return pages;
+    }
 
     res = ram_save_release_protection(rs, pss, start_page);
     return (res < 0 ? res : pages);

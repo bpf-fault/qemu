@@ -65,6 +65,10 @@ static struct {
     QEMUFile *current_file;
     RAMBlock *last_sent_block;
     int pages_written;
+    /* MRU cache for find_block_state — ring buffer entries are typically
+     * clustered by RAMBlock, so this short-circuits the linear search. */
+    RAMBlock *last_resolved_block;
+    BpfFaultBlockState *last_resolved_bs;
 } bpf_state;
 
 static int bpf_link_writeprotect(int link_fd, uint64_t start, uint64_t len,
@@ -85,11 +89,20 @@ static int bpf_link_writeprotect(int link_fd, uint64_t start, uint64_t len,
  */
 static BpfFaultBlockState *find_block_state(RAMBlock *block)
 {
+    if (bpf_state.last_resolved_block == block) {
+        return bpf_state.last_resolved_bs;
+    }
+
     for (int i = 0; i < bpf_state.num_blocks; i++) {
         if (bpf_state.block_states[i].block == block) {
+            bpf_state.last_resolved_block = block;
+            bpf_state.last_resolved_bs = &bpf_state.block_states[i];
             return &bpf_state.block_states[i];
         }
     }
+
+    bpf_state.last_resolved_block = block;
+    bpf_state.last_resolved_bs = NULL;
     return NULL;
 }
 
@@ -310,6 +323,8 @@ fail:
     g_free(bpf_state.block_states);
     bpf_state.block_states = NULL;
     bpf_state.num_blocks = 0;
+    bpf_state.last_resolved_block = NULL;
+    bpf_state.last_resolved_bs = NULL;
 
     if (bpf_state.ringbuf) {
         ring_buffer__free(bpf_state.ringbuf);
@@ -349,6 +364,8 @@ void bpf_fault_wp_stop(void)
     g_free(bpf_state.block_states);
     bpf_state.block_states = NULL;
     bpf_state.num_blocks = 0;
+    bpf_state.last_resolved_block = NULL;
+    bpf_state.last_resolved_bs = NULL;
 
     if (bpf_state.skel) {
         bpf_fault_snapshot_bpf__destroy(bpf_state.skel);
