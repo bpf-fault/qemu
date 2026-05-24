@@ -1505,25 +1505,21 @@ static RAMBlock *poll_fault_page(RAMState *rs, ram_addr_t *offset)
  * Returns 0 on success, negative value in case of an error
 */
 static int ram_save_release_protection(RAMState *rs, PageSearchStatus *pss,
-        unsigned long start_page, unsigned long npages)
+        unsigned long start_page)
 {
     int res = 0;
-
-    if (!npages) {
-        return 0;
-    }
 
     /* Check if page is from bpf_fault-managed region. */
     if (pss->block->flags & RAM_BPF_FAULT_WP) {
         qemu_fflush(pss->pss_channel);
         return bpf_fault_release_protection(pss->block, start_page,
-                                             npages);
+                                             pss->page - start_page);
     }
 
     /* Check if page is from UFFD-managed region. */
     if (pss->block->flags & RAM_UF_WRITEPROTECT) {
         void *page_address = pss->block->host + (start_page << TARGET_PAGE_BITS);
-        uint64_t run_length = npages << TARGET_PAGE_BITS;
+        uint64_t run_length = (pss->page - start_page) << TARGET_PAGE_BITS;
 
         /* Flush async buffers before un-protect. */
         qemu_fflush(pss->pss_channel);
@@ -1859,12 +1855,11 @@ static RAMBlock *poll_fault_page(RAMState *rs, ram_addr_t *offset)
 }
 
 static int ram_save_release_protection(RAMState *rs, PageSearchStatus *pss,
-        unsigned long start_page, unsigned long npages)
+        unsigned long start_page)
 {
     (void) rs;
     (void) pss;
     (void) start_page;
-    (void) npages;
 
     return 0;
 }
@@ -2280,8 +2275,6 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
     size_t pagesize_bits =
         qemu_ram_pagesize(pss->block) >> TARGET_PAGE_BITS;
     unsigned long start_page = pss->page;
-    unsigned long streamed_run_start = 0;
-    bool streamed_run_active = false;
     int res;
 
     if (migrate_ram_is_ignored(pss->block)) {
@@ -2293,9 +2286,6 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
     pss_host_page_prepare(pss);
 
     do {
-        unsigned long current_page = pss->page;
-        bool page_captured = false;
-
         page_dirty = migration_bitmap_clear_dirty(rs, pss->block, pss->page);
 
         /* Check the pages is dirty and if it is send it */
@@ -2303,7 +2293,6 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
             bpf_fault_page_captured(pss->block, pss->page)) {
             /* Already captured via BPF ring buffer, skip save */
             tmppages = 0;
-            page_captured = true;
         } else if (page_dirty) {
             /*
              * Properly yield the lock only in postcopy preempt mode
@@ -2336,44 +2325,12 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
             return tmppages;
         }
 
-        /*
-         * bpf_fault clears WP in the kernel fault path for ring-captured
-         * pages already, so only release protection for pages that were
-         * actually streamed by the normal migration path.
-         */
-        if (pss->block->flags & RAM_BPF_FAULT_WP) {
-            if (page_dirty && !page_captured) {
-                if (!streamed_run_active) {
-                    streamed_run_start = current_page;
-                    streamed_run_active = true;
-                }
-            } else if (streamed_run_active) {
-                res = ram_save_release_protection(rs, pss, streamed_run_start,
-                                                  current_page - streamed_run_start);
-                if (res < 0) {
-                    pss_host_page_finish(pss);
-                    return res;
-                }
-                streamed_run_active = false;
-            }
-        }
-
         pss_find_next_dirty(pss);
     } while (pss_within_range(pss));
 
     pss_host_page_finish(pss);
 
-    if (pss->block->flags & RAM_BPF_FAULT_WP) {
-        if (!streamed_run_active) {
-            return pages;
-        }
-        res = ram_save_release_protection(rs, pss, streamed_run_start,
-                                          pss->page - streamed_run_start);
-        return (res < 0 ? res : pages);
-    }
-
-    res = ram_save_release_protection(rs, pss, start_page,
-                                      pss->page - start_page);
+    res = ram_save_release_protection(rs, pss, start_page);
     return (res < 0 ? res : pages);
 }
 
@@ -3409,23 +3366,19 @@ static int ram_save_iterate(QEMUFile *f, void *opaque)
                  * qemu_clock_get_ns() is a bit expensive, so we only check each
                  * some iterations
                  */
-                if (migrate_bpf_fault_snapshot()) {
-                    int ring_pages = bpf_fault_poll_ring(
-                        f, &rs->pss[RAM_CHANNEL_PRECOPY].last_sent_block);
-                    if (ring_pages > 0) {
-                        rs->target_page_count += ring_pages;
-                    } else if (ring_pages < 0) {
-                        qemu_file_set_error(f, ring_pages);
-                        break;
-                    }
-                }
-
                 if ((i & 63) == 0) {
                     uint64_t t1 = (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0) /
                         1000000;
                     if (t1 > MAX_WAIT) {
                         trace_ram_save_iterate_big_wait(t1, i);
                         break;
+                    }
+
+                    if (migrate_bpf_fault_snapshot()) {
+                        int ring_pages = bpf_fault_poll_ring(f);
+                        if (ring_pages > 0) {
+                            rs->target_page_count += ring_pages;
+                        }
                     }
                 }
                 i++;
@@ -3473,14 +3426,9 @@ void ram_save_bpf_final_drain(QEMUFile *f)
 {
     int ring_pages;
     int max_rounds = 256;
-    RAMBlock *last_sent_block = ram_state ?
-        ram_state->pss[RAM_CHANNEL_PRECOPY].last_sent_block : NULL;
-    RAMBlock **last_sent_blockp = ram_state ?
-        &ram_state->pss[RAM_CHANNEL_PRECOPY].last_sent_block :
-        &last_sent_block;
 
     do {
-        ring_pages = bpf_fault_poll_ring(f, last_sent_blockp);
+        ring_pages = bpf_fault_poll_ring(f);
         if (ring_pages > 0 && ram_state) {
             ram_state->target_page_count += ring_pages;
         }
