@@ -3443,6 +3443,7 @@ void ram_save_bpf_final_drain(QEMUFile *f)
 {
     int ring_pages;
     int max_rounds = 256;
+    uint64_t drops;
 
     do {
         ring_pages = bpf_fault_poll_ring(f);
@@ -3450,6 +3451,26 @@ void ram_save_bpf_final_drain(QEMUFile *f)
             ram_state->target_page_count += ring_pages;
         }
     } while (ring_pages > 0 && --max_rounds > 0);
+
+    /* Issue any deferred WP-release before bpf_fault_wp_stop tears down the
+     * links. (wp_stop also flushes defensively, but doing it here keeps the
+     * release ordering before the stop's other cleanup.) */
+    bpf_fault_release_protection_flush();
+
+    /* If the BPF ring buffer overflowed at any point during the snapshot,
+     * some pre-write page content was lost and the linear scan will have
+     * captured post-write data for those pages — the saved snapshot is
+     * inconsistent. Fail loudly so the operator doesn't think they have a
+     * usable snapshot. */
+    drops = bpf_fault_ringbuf_drop_count();
+    if (drops > 0) {
+        error_report("bpf_fault: ring buffer dropped %" PRIu64 " pre-image(s)"
+                     " during snapshot; the saved memory is INCONSISTENT."
+                     " Consider increasing the ring buffer size or reducing"
+                     " guest write rate during the snapshot window.",
+                     drops);
+        qemu_file_set_error(f, -EIO);
+    }
 }
 
 /**

@@ -56,6 +56,16 @@ typedef struct BpfFaultBlockState {
     unsigned long num_pages;
 } BpfFaultBlockState;
 
+/*
+ * Threshold for flushing the deferred WP-release range. Each
+ * bpf_link_writeprotect() call broadcasts a TLB-IPI to every CPU running the
+ * guest mm; with per-page release that's one IPI per dirty target page,
+ * which dominates guest throughput during a snapshot. Batching into 16 MiB
+ * runs matches Firecracker's LINEAR_BATCH and keeps the IPI rate down by
+ * 4096x for 4 KiB pages.
+ */
+#define BPF_FAULT_RELEASE_BATCH_PAGES 4096   /* 16 MiB at 4 KiB target page */
+
 static struct {
     struct bpf_fault_snapshot_bpf *skel;
     struct ring_buffer *ringbuf;
@@ -69,6 +79,12 @@ static struct {
      * clustered by RAMBlock, so this short-circuits the linear search. */
     RAMBlock *last_resolved_block;
     BpfFaultBlockState *last_resolved_bs;
+    /* Deferred wp-release range. Coalesced across contiguous calls and
+     * flushed when the run is full, the block changes, or callers force
+     * a flush. */
+    RAMBlock *pending_release_block;
+    unsigned long pending_release_start;
+    unsigned long pending_release_npages;
 } bpf_state;
 
 static int bpf_link_writeprotect(int link_fd, uint64_t start, uint64_t len,
@@ -340,6 +356,11 @@ void bpf_fault_wp_stop(void)
 {
     RAMBlock *block;
 
+    /* Flush any deferred WP-release before the links go away — issue_release
+     * uses find_block_state, which relies on bpf_state.block_states still
+     * being valid. Errors are reported but cleanup must continue. */
+    (void)bpf_fault_release_protection_flush();
+
     if (bpf_state.ringbuf) {
         ring_buffer__free(bpf_state.ringbuf);
         bpf_state.ringbuf = NULL;
@@ -386,10 +407,17 @@ int bpf_fault_poll_ring(QEMUFile *f)
     bpf_state.current_file = f;
     bpf_state.pages_written = 0;
 
-    /* Non-blocking poll: timeout = 0 */
-    ret = ring_buffer__poll(bpf_state.ringbuf, 0);
+    /*
+     * Use ring_buffer__consume instead of ring_buffer__poll(rb, 0): poll()
+     * always issues epoll_wait, even for a 0 timeout, which is a wasted
+     * syscall when we just want to drain any already-published records. The
+     * BPF program submits with BPF_RB_NO_WAKEUP, so there is no event to
+     * wait for anyway — consume() walks the consumer/producer cursors in
+     * the mmap'd metadata pages and runs the callback for each record.
+     */
+    ret = ring_buffer__consume(bpf_state.ringbuf);
     if (ret < 0 && ret != -EINTR) {
-        error_report("bpf_fault: ring buffer poll error: %s",
+        error_report("bpf_fault: ring buffer consume error: %s",
                      strerror(-ret));
         return ret;
     }
@@ -409,17 +437,49 @@ bool bpf_fault_page_captured(RAMBlock *block, unsigned long page)
     return test_bit(page, bs->captured_bitmap);
 }
 
-int bpf_fault_release_protection(RAMBlock *block, unsigned long start_page,
-                                  unsigned long npages)
+uint64_t bpf_fault_ringbuf_drop_count(void)
+{
+    int map_fd, n_cpus;
+    uint32_t key = 0;
+    uint64_t total = 0;
+    uint64_t *values = NULL;
+
+    if (!bpf_state.skel) {
+        return 0;
+    }
+
+    map_fd = bpf_map__fd(bpf_state.skel->maps.drop_counter);
+    if (map_fd < 0) {
+        return 0;
+    }
+
+    n_cpus = libbpf_num_possible_cpus();
+    if (n_cpus <= 0) {
+        return 0;
+    }
+
+    values = g_new0(uint64_t, n_cpus);
+    if (bpf_map_lookup_elem(map_fd, &key, values) == 0) {
+        for (int i = 0; i < n_cpus; i++) {
+            total += values[i];
+        }
+    }
+    g_free(values);
+    return total;
+}
+
+/*
+ * issue_release: do the actual bpf() syscall for one (block, start, npages).
+ * This is the only place that calls into the kernel; bpf_fault_release_protection
+ * and bpf_fault_release_protection_flush funnel into it.
+ */
+static int issue_release(RAMBlock *block, unsigned long start_page,
+                         unsigned long npages)
 {
     BpfFaultBlockState *bs;
     void *page_address;
     uint64_t run_length;
     int link_fd;
-
-    if (!npages) {
-        return 0;
-    }
 
     bs = find_block_state(block);
     if (!bs || !bs->link) {
@@ -446,5 +506,59 @@ int bpf_fault_release_protection(RAMBlock *block, unsigned long start_page,
         return -1;
     }
 
+    return 0;
+}
+
+int bpf_fault_release_protection_flush(void)
+{
+    RAMBlock *block = bpf_state.pending_release_block;
+    unsigned long start = bpf_state.pending_release_start;
+    unsigned long npages = bpf_state.pending_release_npages;
+    int ret;
+
+    if (!block || !npages) {
+        bpf_state.pending_release_block = NULL;
+        bpf_state.pending_release_npages = 0;
+        return 0;
+    }
+
+    /* Clear pending state before the syscall so a partial failure can't be
+     * re-flushed against stale state. */
+    bpf_state.pending_release_block = NULL;
+    bpf_state.pending_release_start = 0;
+    bpf_state.pending_release_npages = 0;
+
+    ret = issue_release(block, start, npages);
+    return ret;
+}
+
+int bpf_fault_release_protection(RAMBlock *block, unsigned long start_page,
+                                  unsigned long npages)
+{
+    int ret;
+
+    if (!npages) {
+        return 0;
+    }
+
+    /* Coalesce with the pending range if same block and immediately adjacent. */
+    if (bpf_state.pending_release_block == block &&
+        bpf_state.pending_release_start + bpf_state.pending_release_npages
+            == start_page) {
+        bpf_state.pending_release_npages += npages;
+    } else {
+        /* Different block or non-contiguous: flush the previous run first. */
+        ret = bpf_fault_release_protection_flush();
+        if (ret < 0) {
+            return ret;
+        }
+        bpf_state.pending_release_block = block;
+        bpf_state.pending_release_start = start_page;
+        bpf_state.pending_release_npages = npages;
+    }
+
+    if (bpf_state.pending_release_npages >= BPF_FAULT_RELEASE_BATCH_PAGES) {
+        return bpf_fault_release_protection_flush();
+    }
     return 0;
 }

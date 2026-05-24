@@ -81,9 +81,39 @@ bool bpf_fault_page_captured(RAMBlock *block, unsigned long page);
  * @start_page: first page index in the range
  * @npages: number of pages to un-protect
  *
+ * The release is queued and coalesced with the previous pending range when
+ * contiguous (same block, immediately adjacent pages). Pending releases are
+ * issued as one bpf() syscall — and therefore one TLB-IPI broadcast — once
+ * the queued run exceeds the batch threshold or callers invoke
+ * bpf_fault_release_protection_flush().
+ *
  * Returns 0 on success, negative value on error.
  */
 int bpf_fault_release_protection(RAMBlock *block, unsigned long start_page,
                                   unsigned long npages);
+
+/**
+ * bpf_fault_release_protection_flush: drain any queued WP-release range
+ *
+ * Issues the deferred bpf() syscall for the currently-pending range, if any.
+ * Call this at points where leaving the range deferred would be incorrect
+ * (block teardown) or starve consumers waiting on WP-clear (snapshot end).
+ *
+ * Returns 0 on success, negative value on error.
+ */
+int bpf_fault_release_protection_flush(void);
+
+/**
+ * bpf_fault_ringbuf_drop_count: total number of pre-images dropped because
+ * the BPF ring buffer was full at fault time.
+ *
+ * A non-zero value means the snapshot saw guest writes whose pre-images
+ * could not be captured, so the saved stream may contain post-write data
+ * for some pages and is inconsistent. Callers should check this once
+ * draining is done.
+ *
+ * Returns the cumulative drop count, or 0 if the counter map is unavailable.
+ */
+uint64_t bpf_fault_ringbuf_drop_count(void);
 
 #endif /* QEMU_MIGRATION_BPF_FAULT_SNAPSHOT_H */

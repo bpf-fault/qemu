@@ -45,3 +45,13 @@ int bpf_fault_release_protection(RAMBlock *block, unsigned long start_page,
 {
     g_assert_not_reached();
 }
+
+int bpf_fault_release_protection_flush(void)
+{
+    return 0;
+}
+
+uint64_t bpf_fault_ringbuf_drop_count(void)
+{
+    return 0;
+}
