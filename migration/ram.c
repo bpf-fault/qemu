@@ -435,6 +435,19 @@ struct RAMState {
      * Protected by @bitmap_mutex.
      */
     PageLocationHint page_hint;
+
+    /*
+     * Deferred UFFD WP-release. Coalesces contiguous (block, addr, len)
+     * releases from the linear scan into one uffd_change_protection call,
+     * which keeps the per-syscall TLB-IPI cost from dominating guest
+     * throughput during the snapshot window. Same idea as the bpf_fault
+     * batching in migration/bpf-fault-snapshot.c.
+     *
+     * Only touched by the migration thread, so no extra locking.
+     */
+    RAMBlock *pending_uffd_release_block;
+    void *pending_uffd_release_addr;
+    uint64_t pending_uffd_release_len;
 };
 typedef struct RAMState RAMState;
 
@@ -1494,16 +1507,51 @@ static RAMBlock *poll_fault_page(RAMState *rs, ram_addr_t *offset)
     return block;
 }
 
+/*
+ * Threshold for flushing the deferred UFFD WP-release range. Same
+ * reasoning as BPF_FAULT_RELEASE_BATCH_PAGES: one ioctl(UFFDIO_WRITEPROTECT)
+ * triggers one TLB-IPI broadcast in the kernel regardless of the range
+ * length, so coalescing 4096 4 KiB pages into one syscall cuts the IPI
+ * rate by ~4096x.
+ */
+#define UFFD_RELEASE_BATCH_BYTES (4096UL * TARGET_PAGE_SIZE)
+
+static int uffd_release_flush(RAMState *rs)
+{
+    void *addr = rs->pending_uffd_release_addr;
+    uint64_t len = rs->pending_uffd_release_len;
+    int res;
+
+    if (!len) {
+        rs->pending_uffd_release_block = NULL;
+        rs->pending_uffd_release_addr = NULL;
+        return 0;
+    }
+
+    /* Clear pending state before the syscall so a partial failure can't be
+     * re-flushed against stale state. */
+    rs->pending_uffd_release_block = NULL;
+    rs->pending_uffd_release_addr = NULL;
+    rs->pending_uffd_release_len = 0;
+
+    res = uffd_change_protection(rs->uffdio_fd, addr, len, false, false);
+    return res;
+}
+
 /**
- * ram_save_release_protection: release UFFD write protection after
+ * ram_save_release_protection: release UFFD/bpf_fault write protection after
  *   a range of pages has been saved
+ *
+ * For both backends, contiguous releases are coalesced into a single
+ * range-clearing syscall to keep TLB-IPI broadcast overhead from dominating
+ * guest throughput during the snapshot window.
  *
  * @rs: current RAM state
  * @pss: page-search-status structure
  * @start_page: index of the first page in the range relative to pss->block
  *
  * Returns 0 on success, negative value in case of an error
-*/
+ */
 static int ram_save_release_protection(RAMState *rs, PageSearchStatus *pss,
         unsigned long start_page)
 {
@@ -1521,11 +1569,35 @@ static int ram_save_release_protection(RAMState *rs, PageSearchStatus *pss,
         void *page_address = pss->block->host + (start_page << TARGET_PAGE_BITS);
         uint64_t run_length = (pss->page - start_page) << TARGET_PAGE_BITS;
 
-        /* Flush async buffers before un-protect. */
+        if (!run_length) {
+            return 0;
+        }
+
+        /* Flush async buffers before un-protect — otherwise the saved
+         * page bytes could still be in the QEMUFile buffer when the
+         * kernel clears WP and the guest is allowed to overwrite the
+         * page in place. */
         qemu_fflush(pss->pss_channel);
-        /* Un-protect memory range. */
-        res = uffd_change_protection(rs->uffdio_fd, page_address, run_length,
-                false, false);
+
+        /* Coalesce with the pending range if same block and immediately
+         * adjacent. */
+        if (rs->pending_uffd_release_block == pss->block &&
+            (uint8_t *)rs->pending_uffd_release_addr +
+                rs->pending_uffd_release_len == (uint8_t *)page_address) {
+            rs->pending_uffd_release_len += run_length;
+        } else {
+            res = uffd_release_flush(rs);
+            if (res < 0) {
+                return res;
+            }
+            rs->pending_uffd_release_block = pss->block;
+            rs->pending_uffd_release_addr = page_address;
+            rs->pending_uffd_release_len = run_length;
+        }
+
+        if (rs->pending_uffd_release_len >= UFFD_RELEASE_BATCH_BYTES) {
+            res = uffd_release_flush(rs);
+        }
     }
 
     return res;
@@ -1822,6 +1894,12 @@ void ram_write_tracking_stop(void)
         return;
     }
 
+    /* Drain any deferred UFFD WP-release before the fd goes away.
+     * unregister_memory will implicitly clear WP for the range too, but
+     * doing the flush first keeps the wp-clear ordering consistent for
+     * any code that checks. Errors are reported and cleanup continues. */
+    (void)uffd_release_flush(rs);
+
     RCU_READ_LOCK_GUARD();
 
     RAMBLOCK_FOREACH_NOT_IGNORED(block) {
@@ -1930,6 +2008,16 @@ static bool get_queued_page(RAMState *rs, PageSearchStatus *pss)
          * when we have vcpus got blocked by the write protected pages.
          */
         block = poll_fault_page(rs, &offset);
+        if (block) {
+            /*
+             * A faulted page means a vCPU is blocked waiting for this
+             * page to be saved + un-protected. Flush any deferred
+             * batch immediately so that the upcoming release will
+             * actually wake the vCPU instead of being deferred behind
+             * the rest of the linear scan.
+             */
+            (void)uffd_release_flush(rs);
+        }
     }
 
     if (block) {
