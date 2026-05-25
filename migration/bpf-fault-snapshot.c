@@ -358,8 +358,9 @@ void bpf_fault_wp_stop(void)
 
     /* Flush any deferred WP-release before the links go away — issue_release
      * uses find_block_state, which relies on bpf_state.block_states still
-     * being valid. Errors are reported but cleanup must continue. */
-    (void)bpf_fault_release_protection_flush();
+     * being valid. Errors are reported but cleanup must continue. The stream
+     * is done by this point so no QEMUFile fflush is needed. */
+    (void)bpf_fault_release_protection_flush(NULL);
 
     if (bpf_state.ringbuf) {
         ring_buffer__free(bpf_state.ringbuf);
@@ -509,7 +510,7 @@ static int issue_release(RAMBlock *block, unsigned long start_page,
     return 0;
 }
 
-int bpf_fault_release_protection_flush(void)
+int bpf_fault_release_protection_flush(QEMUFile *f)
 {
     RAMBlock *block = bpf_state.pending_release_block;
     unsigned long start = bpf_state.pending_release_start;
@@ -528,11 +529,21 @@ int bpf_fault_release_protection_flush(void)
     bpf_state.pending_release_start = 0;
     bpf_state.pending_release_npages = 0;
 
+    /* Commit any async-queued page bytes (save_normal_page uses
+     * qemu_put_buffer_async, which only stashes a pointer) to the migration
+     * stream BEFORE telling the kernel to drop WP. Otherwise the guest can
+     * race in between the wp-clear and the eventual writev and we'd write
+     * post-write content for some pages without a ring-buffer override. */
+    if (f) {
+        qemu_fflush(f);
+    }
+
     ret = issue_release(block, start, npages);
     return ret;
 }
 
-int bpf_fault_release_protection(RAMBlock *block, unsigned long start_page,
+int bpf_fault_release_protection(QEMUFile *f, RAMBlock *block,
+                                  unsigned long start_page,
                                   unsigned long npages)
 {
     int ret;
@@ -548,7 +559,7 @@ int bpf_fault_release_protection(RAMBlock *block, unsigned long start_page,
         bpf_state.pending_release_npages += npages;
     } else {
         /* Different block or non-contiguous: flush the previous run first. */
-        ret = bpf_fault_release_protection_flush();
+        ret = bpf_fault_release_protection_flush(f);
         if (ret < 0) {
             return ret;
         }
@@ -558,7 +569,7 @@ int bpf_fault_release_protection(RAMBlock *block, unsigned long start_page,
     }
 
     if (bpf_state.pending_release_npages >= BPF_FAULT_RELEASE_BATCH_PAGES) {
-        return bpf_fault_release_protection_flush();
+        return bpf_fault_release_protection_flush(f);
     }
     return 0;
 }

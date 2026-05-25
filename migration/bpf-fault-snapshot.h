@@ -77,6 +77,10 @@ bool bpf_fault_page_captured(RAMBlock *block, unsigned long page);
 /**
  * bpf_fault_release_protection: remove write-protection from a page range
  *
+ * @f: QEMUFile carrying the migration stream — fflush()'d before the kernel
+ *     wp-release syscall so any async-queued page pointers commit to the
+ *     stream before the guest is allowed to overwrite the underlying pages.
+ *     May be NULL when called from cleanup paths where the stream is done.
  * @block: RAM block containing the range
  * @start_page: first page index in the range
  * @npages: number of pages to un-protect
@@ -89,7 +93,8 @@ bool bpf_fault_page_captured(RAMBlock *block, unsigned long page);
  *
  * Returns 0 on success, negative value on error.
  */
-int bpf_fault_release_protection(RAMBlock *block, unsigned long start_page,
+int bpf_fault_release_protection(QEMUFile *f, RAMBlock *block,
+                                  unsigned long start_page,
                                   unsigned long npages);
 
 /**
@@ -99,9 +104,11 @@ int bpf_fault_release_protection(RAMBlock *block, unsigned long start_page,
  * Call this at points where leaving the range deferred would be incorrect
  * (block teardown) or starve consumers waiting on WP-clear (snapshot end).
  *
+ * @f: see bpf_fault_release_protection.
+ *
  * Returns 0 on success, negative value on error.
  */
-int bpf_fault_release_protection_flush(void);
+int bpf_fault_release_protection_flush(QEMUFile *f);
 
 /**
  * bpf_fault_ringbuf_drop_count: total number of pre-images dropped because

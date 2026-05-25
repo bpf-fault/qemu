@@ -40,13 +40,14 @@ bool bpf_fault_page_captured(RAMBlock *block, unsigned long page)
     return false;
 }
 
-int bpf_fault_release_protection(RAMBlock *block, unsigned long start_page,
+int bpf_fault_release_protection(QEMUFile *f, RAMBlock *block,
+                                  unsigned long start_page,
                                   unsigned long npages)
 {
     g_assert_not_reached();
 }
 
-int bpf_fault_release_protection_flush(void)
+int bpf_fault_release_protection_flush(QEMUFile *f)
 {
     return 0;
 }

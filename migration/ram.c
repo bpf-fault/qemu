@@ -1516,7 +1516,7 @@ static RAMBlock *poll_fault_page(RAMState *rs, ram_addr_t *offset)
  */
 #define UFFD_RELEASE_BATCH_BYTES (4096UL * TARGET_PAGE_SIZE)
 
-static int uffd_release_flush(RAMState *rs)
+static int uffd_release_flush(RAMState *rs, QEMUFile *f)
 {
     void *addr = rs->pending_uffd_release_addr;
     uint64_t len = rs->pending_uffd_release_len;
@@ -1533,6 +1533,14 @@ static int uffd_release_flush(RAMState *rs)
     rs->pending_uffd_release_block = NULL;
     rs->pending_uffd_release_addr = NULL;
     rs->pending_uffd_release_len = 0;
+
+    /* Commit async-queued page bytes (save_normal_page → put_buffer_async)
+     * to the stream BEFORE telling uffd to drop WP. Without this, the
+     * guest could race in between wp-clear and the eventual writev and
+     * we'd ship post-write content for some pages. */
+    if (f) {
+        qemu_fflush(f);
+    }
 
     res = uffd_change_protection(rs->uffdio_fd, addr, len, false, false);
     return res;
@@ -1559,8 +1567,12 @@ static int ram_save_release_protection(RAMState *rs, PageSearchStatus *pss,
 
     /* Check if page is from bpf_fault-managed region. */
     if (pss->block->flags & RAM_BPF_FAULT_WP) {
-        qemu_fflush(pss->pss_channel);
-        return bpf_fault_release_protection(pss->block, start_page,
+        /* bpf_fault_release_protection coalesces and does its own
+         * qemu_fflush() right before the actual wp-resolve syscall, so
+         * we don't do the per-page fflush here — that would defeat the
+         * batching. */
+        return bpf_fault_release_protection(pss->pss_channel, pss->block,
+                                             start_page,
                                              pss->page - start_page);
     }
 
@@ -1573,11 +1585,9 @@ static int ram_save_release_protection(RAMState *rs, PageSearchStatus *pss,
             return 0;
         }
 
-        /* Flush async buffers before un-protect — otherwise the saved
-         * page bytes could still be in the QEMUFile buffer when the
-         * kernel clears WP and the guest is allowed to overwrite the
-         * page in place. */
-        qemu_fflush(pss->pss_channel);
+        /* uffd_release_flush() does the qemu_fflush() before the actual
+         * ioctl, so we don't fflush per page here — that would defeat
+         * the batching. */
 
         /* Coalesce with the pending range if same block and immediately
          * adjacent. */
@@ -1586,7 +1596,7 @@ static int ram_save_release_protection(RAMState *rs, PageSearchStatus *pss,
                 rs->pending_uffd_release_len == (uint8_t *)page_address) {
             rs->pending_uffd_release_len += run_length;
         } else {
-            res = uffd_release_flush(rs);
+            res = uffd_release_flush(rs, pss->pss_channel);
             if (res < 0) {
                 return res;
             }
@@ -1596,7 +1606,7 @@ static int ram_save_release_protection(RAMState *rs, PageSearchStatus *pss,
         }
 
         if (rs->pending_uffd_release_len >= UFFD_RELEASE_BATCH_BYTES) {
-            res = uffd_release_flush(rs);
+            res = uffd_release_flush(rs, pss->pss_channel);
         }
     }
 
@@ -1897,8 +1907,10 @@ void ram_write_tracking_stop(void)
     /* Drain any deferred UFFD WP-release before the fd goes away.
      * unregister_memory will implicitly clear WP for the range too, but
      * doing the flush first keeps the wp-clear ordering consistent for
-     * any code that checks. Errors are reported and cleanup continues. */
-    (void)uffd_release_flush(rs);
+     * any code that checks. The stream is done by this point so no
+     * QEMUFile fflush is needed. Errors are reported and cleanup
+     * continues. */
+    (void)uffd_release_flush(rs, NULL);
 
     RCU_READ_LOCK_GUARD();
 
@@ -2016,7 +2028,7 @@ static bool get_queued_page(RAMState *rs, PageSearchStatus *pss)
              * actually wake the vCPU instead of being deferred behind
              * the rest of the linear scan.
              */
-            (void)uffd_release_flush(rs);
+            (void)uffd_release_flush(rs, pss->pss_channel);
         }
     }
 
@@ -2363,7 +2375,6 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
     size_t pagesize_bits =
         qemu_ram_pagesize(pss->block) >> TARGET_PAGE_BITS;
     unsigned long start_page = pss->page;
-    bool any_captured = false;
     int res;
 
     if (migrate_ram_is_ignored(pss->block)) {
@@ -2380,11 +2391,12 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
         /* Check the pages is dirty and if it is send it */
         if (page_dirty && migrate_bpf_fault_snapshot() &&
             bpf_fault_page_captured(pss->block, pss->page)) {
-            /* Already captured via BPF ring buffer, skip save.
-             * The kernel WP-fault handler already cleared WP for this page,
-             * so we don't need to release it again from userspace. */
+            /* Already captured via BPF ring buffer, skip save. The kernel
+             * WP-fault handler cleared WP for this page during the fault, so
+             * the release_protection call below is a per-PTE no-op — but
+             * we still want it in the batched range so coalescing isn't
+             * broken by captured-page gaps in an otherwise-contiguous run. */
             tmppages = 0;
-            any_captured = true;
         } else if (page_dirty) {
             /*
              * Properly yield the lock only in postcopy preempt mode
@@ -2421,19 +2433,6 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss)
     } while (pss_within_range(pss));
 
     pss_host_page_finish(pss);
-
-    /*
-     * For bpf_fault, the kernel WP-fault handler already cleared WP for any
-     * ring-captured pages in this host page. With hugepages disabled (the
-     * only supported configuration for bpf_fault), the host page is a single
-     * target page, so we can skip the release entirely when that page was
-     * captured. With hugepages enabled, this would leak WP on some captured
-     * pages — they'd take a redundant ring buffer round-trip on the next
-     * write, but the snapshot remains correct.
-     */
-    if (any_captured && (pss->block->flags & RAM_BPF_FAULT_WP)) {
-        return pages;
-    }
 
     res = ram_save_release_protection(rs, pss, start_page);
     return (res < 0 ? res : pages);
@@ -3542,8 +3541,9 @@ void ram_save_bpf_final_drain(QEMUFile *f)
 
     /* Issue any deferred WP-release before bpf_fault_wp_stop tears down the
      * links. (wp_stop also flushes defensively, but doing it here keeps the
-     * release ordering before the stop's other cleanup.) */
-    bpf_fault_release_protection_flush();
+     * release ordering before the stop's other cleanup.) Pass the QEMUFile
+     * so any async-queued page bytes get fflush()'d before the wp-clear. */
+    bpf_fault_release_protection_flush(f);
 
     /* If the BPF ring buffer overflowed at any point during the snapshot,
      * some pre-write page content was lost and the linear scan will have
