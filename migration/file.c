@@ -17,6 +17,7 @@
 #include "io/channel-socket.h"
 #include "io/channel-util.h"
 #include "options.h"
+#include "ram.h"
 #include "trace.h"
 
 #define OFFSET_OPTION ",offset="
@@ -113,6 +114,27 @@ QIOChannel *file_connect_outgoing(MigrationState *s,
                          "failed to truncate migration file to offset %" PRIx64,
                          offset);
         goto out;
+    }
+
+    /*
+     * Pre-allocate space for the entire guest RAM. Without this, the
+     * filesystem allocates blocks on demand during each write — on tmpfs
+     * that means shmem_alloc_and_add_folio + clear_page for every 4 KiB
+     * page (the Firecracker authors observed ~42% of VMM-thread time on
+     * this path), and even on ext4 each new write hits the block
+     * allocator. fallocate'ing upfront turns each subsequent writev into
+     * an overwrite of an already-allocated extent, freeing the migration
+     * thread to actually push bytes instead of waiting on metadata.
+     * For background snapshots the file equals guest RAM size + a few MB
+     * of non-RAM state; for regular migrations the size is harder to
+     * predict, so we cap the preallocation at guest RAM size and let any
+     * tail extend the file the normal way.
+     */
+    {
+        uint64_t ram_size = ram_bytes_total();
+        if (ram_size > 0) {
+            (void)fallocate(fioc->fd, 0, (off_t)offset, (off_t)ram_size);
+        }
     }
 
     outgoing_args.fname = g_strdup(filename);
