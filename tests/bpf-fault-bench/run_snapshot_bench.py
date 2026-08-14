@@ -62,6 +62,11 @@ HOST_IP = "192.168.241.1"
 GUEST_IP = "192.168.241.2"
 
 VCPU_COUNT = 2
+# Fraction of guest RAM to pre-condition, as in the Firecracker
+# benchmark (MEMORY_FILL_FRACTION). The guest's /tmp tmpfs is capped at
+# size=50%, so the effective fill saturates there -- identically in
+# both harnesses, since the write error is discarded in both.
+MEMORY_FILL_FRACTION = 0.75
 TIMESERIES_INTERVAL_S = 0.1
 BASELINE_WINDOW_SEC = 5
 POST_WINDOW_SEC = 5
@@ -313,6 +318,15 @@ def _setup_memcached(vm, mem_size_mib):
            "--protocol=memcache_text --key-maximum=500000 --data-size=512 "
            "-c 10 -t 2 --ratio=1:0 -n allkeys --hide-histogram "
            "--key-pattern=P:P --pipeline=16", timeout=180)
+
+
+def _condition_memory(vm, mem_size_mib):
+    """Populate MEMORY_FILL_FRACTION of guest RAM with urandom data,
+    mirroring the Firecracker benchmark's pre-conditioning so snapshot
+    streaming covers comparably populated memory."""
+    prefill_mib = max(int(mem_size_mib * MEMORY_FILL_FRACTION), 16)
+    vm.ssh(f"head -c {prefill_mib}M /dev/urandom > /tmp/prefill "
+           f"2>/dev/null; sync", timeout=180)
 
 
 def _workload_protocol_params(workload):
@@ -671,6 +685,7 @@ def run_config(qemu_bin, artifacts, results_dir, workload, mode, mem,
     vm = QemuVM(qemu_bin, artifacts, mem, workdir)
     try:
         vm.wait_for_boot()
+        _condition_memory(vm, mem)
         protocol, params = _workload_protocol_params(workload)
         if protocol == "redis":
             _setup_redis(vm, mem, value_size=params.get("value_size", 128))
