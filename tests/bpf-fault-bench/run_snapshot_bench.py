@@ -580,6 +580,10 @@ def _do_migrate_snapshot(vm, t0_ref):
             pass
         # Wait out the cancellation so teardown is clean.
         _wait_migration(qmp, 15)
+    # A completed migration leaves the source paused (postmigrate);
+    # resume it, as a snapshot user would, so post-snapshot service
+    # (and the memtier timeseries) reflect the mode's real behavior.
+    qmp.execute("cont")
     t_end = time.monotonic()
     qmp.drain_events()
     # Downtime = the final stop-copy window (STOP -> completion).
