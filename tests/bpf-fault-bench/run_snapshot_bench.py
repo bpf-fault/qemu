@@ -80,10 +80,15 @@ REDIS_WORKLOAD_PARAMS = {
     "redis_light": {"clients": 2,  "ops": "get",     "value_size": 128, "pipeline": 1},
     "redis_mixed": {"clients": 10, "ops": "set,get", "value_size": 128, "pipeline": 1},
     "redis_heavy": {"clients": 50, "ops": "set",     "value_size": 128, "pipeline": 1},
+    # Saturating variant: pipelining removes the request-round-trip
+    # ceiling, driving the server to capacity (see the Firecracker
+    # benchmark's constants.py, kept in lockstep).
+    "redis_sat":   {"clients": 50, "ops": "set",     "value_size": 128, "pipeline": 16},
 }
 MEMCACHED_WORKLOAD_PARAMS = {
     "memcached_light": {"clients": 2,  "ratio": "1:9"},
     "memcached_heavy": {"clients": 50, "ratio": "1:1"},
+    "memcached_sat":   {"clients": 50, "ratio": "1:1", "pipeline": 16},
 }
 
 MODES = ["full", "migrate", "live", "live_bpf"]
@@ -175,6 +180,16 @@ class QMPClient:
 # ---------------------------------------------------------------------------
 # VM lifecycle
 # ---------------------------------------------------------------------------
+
+def _get_cpu_seconds(pid):
+    """Total CPU seconds (utime+stime) of the QEMU process so far."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+    except (OSError, IndexError, ValueError):
+        return 0.0
+
 
 def _setup_tap():
     subprocess.run(["ip", "link", "del", TAP_NAME],
@@ -694,9 +709,12 @@ def run_config(qemu_bin, artifacts, results_dir, workload, mode, mem,
 
         duration = BASELINE_WINDOW_SEC + MIGRATE_TIMEOUT_S + POST_WINDOW_SEC
         ts = _start_memtier(protocol, params, duration)
+        cpu_baseline_start = _get_cpu_seconds(vm.pid)
         time.sleep(BASELINE_WINDOW_SEC)
+        cpu_snap_start = _get_cpu_seconds(vm.pid)
 
         timing = _MODE_RUNNERS[mode](vm, ts["start_wall"])
+        cpu_snap_end = _get_cpu_seconds(vm.pid)
 
         time.sleep(POST_WINDOW_SEC)
         _stop_memtier(ts)
@@ -707,7 +725,18 @@ def run_config(qemu_bin, artifacts, results_dir, workload, mode, mem,
             os.path.join(results_dir, ts_rel),
             timing["freeze_start_s"], timing["snap_end_s"])
 
+        snap_wall = timing["snap_end_s"] - timing["snap_start_s"]
         results = {
+            "cpu": {
+                "baseline_cpu_s": round(cpu_snap_start - cpu_baseline_start, 3),
+                "during_cpu_s": round(cpu_snap_end - cpu_snap_start, 3),
+                "baseline_util": round(
+                    (cpu_snap_start - cpu_baseline_start)
+                    / BASELINE_WINDOW_SEC, 3),
+                "during_util": round(
+                    (cpu_snap_end - cpu_snap_start) / snap_wall, 3)
+                    if snap_wall > 0 else 0.0,
+            },
             "total_snapshot_ms": round(timing["total_ms"], 3),
             "downtime_ms": round(timing["downtime_ms"], 3),
             "converged": timing["converged"],
