@@ -53,7 +53,9 @@ _DEFAULT_QEMU = os.path.join(_REPO_ROOT, "build", "qemu-system-x86_64")
 _FC_ARTIFACT_GLOB = os.path.join(
     _REPO_ROOT, "..", "firecracker", "build", "artifacts", "s3*", "x86_64")
 
-GUEST_KERNEL = "bzImage-5.10.260"
+# The CI artifact set is the latest build, so the 5.10 guest kernel's
+# patch level moves; find_guest_kernel() picks whichever one is present.
+GUEST_KERNEL_GLOB = "bzImage-5.10.*"
 GUEST_ROOTFS = "ubuntu-24.04-app.ext4"
 GUEST_SSHKEY = "ubuntu-24.04-app.id_rsa"
 
@@ -214,7 +216,7 @@ class QemuVM:
         self.qmp_path = os.path.join(workdir, "qmp.sock")
         self.serial_path = os.path.join(workdir, "serial.log")
         self.sshkey = os.path.join(artifacts, GUEST_SSHKEY)
-        kernel = os.path.join(artifacts, GUEST_KERNEL)
+        kernel = find_guest_kernel(artifacts)
         rootfs = os.path.join(artifacts, GUEST_ROOTFS)
 
         _setup_tap()
@@ -243,9 +245,25 @@ class QemuVM:
             "-display", "none",
             "-qmp", f"unix:{self.qmp_path},server,nowait",
         ]
-        self.proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-        self.qmp = QMPClient(self.qmp_path)
+        self.qemu_log = os.path.join(workdir, "qemu.log")
+        with open(self.qemu_log, "w") as qemu_log:
+            self.proc = subprocess.Popen(
+                cmd, stdout=qemu_log, stderr=subprocess.STDOUT)
+        try:
+            self.qmp = QMPClient(self.qmp_path)
+        except OSError:
+            if self.proc.poll() is None:
+                self.proc.kill()
+                self.proc.wait()
+            _teardown_tap()
+            raise RuntimeError(
+                f"QEMU failed to start (rc={self.proc.returncode}): "
+                f"{self._log_tail()}")
+
+    def _log_tail(self, lines=5):
+        with open(self.qemu_log) as f:
+            tail = f.read().strip().splitlines()[-lines:]
+        return "\n".join(tail) or f"no output; see {self.qemu_log}"
 
     @property
     def pid(self):
@@ -274,8 +292,8 @@ class QemuVM:
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
                 raise RuntimeError(
-                    f"QEMU exited during boot (rc={self.proc.returncode}); "
-                    f"see {self.serial_path}")
+                    f"QEMU exited during boot (rc={self.proc.returncode}): "
+                    f"{self._log_tail()}; see also {self.serial_path}")
             try:
                 self.ssh("true", timeout=8)
                 return
@@ -780,6 +798,20 @@ def run_config(qemu_bin, artifacts, results_dir, workload, mode, mem,
 # Main
 # ---------------------------------------------------------------------------
 
+def find_guest_kernel(artifacts):
+    """Newest bzImage-5.10.<patch> in the artifact set (the -no-acpi
+    variant does not boot on q35)."""
+    kernels = {}
+    for path in glob.glob(os.path.join(artifacts, GUEST_KERNEL_GLOB)):
+        patch = os.path.basename(path).rsplit(".", 1)[-1]
+        if patch.isdigit():
+            kernels[int(patch)] = path
+    if not kernels:
+        log(f"ERROR: no {GUEST_KERNEL_GLOB} guest kernel in {artifacts}")
+        sys.exit(1)
+    return kernels[max(kernels)]
+
+
 def find_artifacts(override):
     for candidate in filter(None, [
             override, os.environ.get("QEMU_BENCH_ARTIFACTS")]):
@@ -835,6 +867,7 @@ def main():
         sys.exit(1)
     artifacts = find_artifacts(args.artifacts_dir)
     log(f"Guest artifacts: {artifacts}")
+    log(f"Guest kernel: {os.path.basename(find_guest_kernel(artifacts))}")
     os.makedirs(args.results_dir, exist_ok=True)
 
     for workload in args.workloads:
