@@ -799,8 +799,7 @@ def run_config(qemu_bin, artifacts, results_dir, workload, mode, mem,
 # ---------------------------------------------------------------------------
 
 def find_guest_kernel(artifacts):
-    """Newest bzImage-5.10.<patch> in the artifact set (the -no-acpi
-    variant does not boot on q35)."""
+    """Newest bzImage-5.10.<patch> in the artifact set."""
     kernels = {}
     for path in glob.glob(os.path.join(artifacts, GUEST_KERNEL_GLOB)):
         patch = os.path.basename(path).rsplit(".", 1)[-1]
